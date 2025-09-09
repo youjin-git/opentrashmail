@@ -1,3 +1,5 @@
 config.ini
 web/version.txt
 python/*.pem
+.DS_Store
+.history

@@ -14,6 +14,7 @@ from aiosmtpd.controller import Controller
 from email.parser import BytesParser
 from email.header import decode_header, make_header
 from email import policy
+from email_database import EmailDatabase
 
 # 配置日志
 logging.basicConfig(
@@ -24,13 +25,23 @@ logging.basicConfig(
         logging.FileHandler('mail_listener.log')
     ]
 )
+
 logger = logging.getLogger(__name__)
 
 # 配置参数
 SMTP_PORT = 25
-ALLOWED_DOMAINS = ["example.com", "test.com", "*.yourdomain.com"]  # 修改为您的域名
 ACCEPT_ALL_DOMAINS = True  # 设置为True可接收所有域名的邮件
 DATA_DIR = "./mail_data"
+
+# MySQL数据库配置
+MYSQL_HOST = "120.27.238.180"
+MYSQL_PORT = 3306
+MYSQL_DATABASE = "tempmail"
+MYSQL_USER = "tempmail"
+MYSQL_PASSWORD = "tempmail"
+
+ENABLE_DATABASE = True  # 是否启用数据库存储
+ENABLE_JSON_BACKUP = True  # 是否保留JSON文件备份
 
 class SimpleMailHandler:
     """简化的邮件处理器"""
@@ -40,6 +51,22 @@ class SimpleMailHandler:
         if not os.path.exists(DATA_DIR):
             os.makedirs(DATA_DIR, exist_ok=True)
             logger.info(f"创建数据目录: {DATA_DIR}")
+        
+        # 初始化数据库连接
+        self.db = None
+        if ENABLE_DATABASE:
+            try:
+                self.db = EmailDatabase(
+                    host=MYSQL_HOST,
+                    port=MYSQL_PORT,
+                    database=MYSQL_DATABASE,
+                    user=MYSQL_USER,
+                    password=MYSQL_PASSWORD
+                )
+                logger.info(f"✅ 数据库连接成功: {MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}")
+            except Exception as e:
+                logger.error(f"❌ 数据库连接失败: {e}")
+                logger.warning("⚠️ 将仅使用JSON文件存储")
     
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
         """处理收件人验证"""
@@ -54,7 +81,7 @@ class SimpleMailHandler:
         domain = address.split('@')[1].lower()
         allowed = False
         
-        for allowed_domain in ALLOWED_DOMAINS:
+        for allowed_domain in ["example.com", "test.com", "*.yourdomain.com"]:  # 修改为您的域名（使用ACCEPT_ALL_DOMAINS时不需要）
             if allowed_domain.startswith("*"):
                 # 通配符域名匹配
                 suffix = allowed_domain[1:]  # 去掉*
@@ -103,7 +130,7 @@ class SimpleMailHandler:
             except Exception as e:
                 logger.error(f"❌ 邮件解析失败: {e}")
                 # 即使解析失败也要保存原始数据
-                self.save_raw_email_data(peer_ip, envelope)
+                self.save_raw_email_data(peer_ip, envelope, str(e))
                 return '250 Message accepted (parsing failed but saved)'
             
             # 提取邮件信息
@@ -158,14 +185,23 @@ class SimpleMailHandler:
                 'from': from_addr,
                 'to': to_addrs,
                 'subject': subject,
-                'plaintext_body': plaintext_body[:1000] + "..." if len(plaintext_body) > 1000 else plaintext_body,
-                'html_body': html_body[:1000] + "..." if len(html_body) > 1000 else html_body,
+                'plaintext_body': plaintext_body,  # 数据库存储完整内容
+                'html_body': html_body,
                 'attachments': attachments,
-                'raw_size': len(envelope.content)
+                'raw_size': len(envelope.content),
+                'raw_content': envelope.content  # 添加原始邮件内容用于数据库存储
             }
             
             # 保存邮件数据
             self.save_email_data(email_data)
+            
+            # 构建用于JSON备份的数据（截断长文本）
+            if ENABLE_JSON_BACKUP:
+                json_data = email_data.copy()
+                json_data['plaintext_body'] = plaintext_body[:1000] + "..." if len(plaintext_body) > 1000 else plaintext_body
+                json_data['html_body'] = html_body[:1000] + "..." if len(html_body) > 1000 else html_body
+                json_data.pop('raw_content', None)  # JSON备份不保存原始内容
+                self.save_json_backup(json_data)
             
             # 在控制台显示邮件摘要
             self.print_email_summary(email_data)
@@ -178,42 +214,87 @@ class SimpleMailHandler:
             return '451 Requested action aborted: local error in processing'
     
     def save_email_data(self, email_data):
-        """保存邮件数据到文件"""
+        """保存邮件数据到数据库和/或文件"""
+        saved_to_db = False
+        
+        # 尝试保存到数据库
+        if ENABLE_DATABASE and self.db:
+            try:
+                email_id = self.db.save_email(email_data)
+                if email_id:
+                    logger.info(f"💾 邮件已保存到数据库，ID: {email_id}")
+                    saved_to_db = True
+                else:
+                    logger.error("❌ 数据库保存失败，将使用文件备份")
+            except Exception as e:
+                logger.error(f"❌ 数据库保存异常: {e}，将使用文件备份")
+        
+        # 如果数据库保存失败或未启用数据库，使用JSON文件备份
+        if not saved_to_db:
+            logger.warning("⚠️ 使用JSON文件存储作为备份")
+            self.save_json_backup(email_data)
+    
+    def save_json_backup(self, email_data):
+        """保存邮件数据到JSON文件作为备份"""
         try:
+            # 为JSON备份移除可能的二进制数据
+            json_data = email_data.copy()
+            json_data.pop('raw_content', None)
+            
             filename = f"email_{int(email_data['timestamp'])}.json"
             filepath = os.path.join(DATA_DIR, filename)
             
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(email_data, f, ensure_ascii=False, indent=2)
+                json.dump(json_data, f, ensure_ascii=False, indent=2)
             
-            logger.info(f"💾 邮件已保存: {filepath}")
+            logger.info(f"💾 邮件JSON备份已保存: {filepath}")
             
         except Exception as e:
-            logger.error(f"保存邮件数据失败: {e}")
+            logger.error(f"保存邮件JSON备份失败: {e}")
     
-    def save_raw_email_data(self, peer_ip, envelope):
+    def save_raw_email_data(self, peer_ip, envelope, error_message):
         """保存原始邮件数据（当解析失败时）"""
-        try:
-            raw_data = {
-                'timestamp': time.time(),
-                'datetime': datetime.now().isoformat(),
-                'sender_ip': peer_ip,
-                'from': envelope.mail_from,
-                'to': envelope.rcpt_tos,
-                'raw_content': envelope.content.decode('utf-8', errors='ignore'),
-                'status': 'parsing_failed'
-            }
-            
-            filename = f"raw_email_{int(raw_data['timestamp'])}.json"
-            filepath = os.path.join(DATA_DIR, filename)
-            
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(raw_data, f, ensure_ascii=False, indent=2)
-            
-            logger.info(f"💾 原始邮件已保存: {filepath}")
-            
-        except Exception as e:
-            logger.error(f"保存原始邮件数据失败: {e}")
+        saved_to_db = False
+        
+        # 尝试保存到数据库
+        if ENABLE_DATABASE and self.db:
+            try:
+                record_id = self.db.save_failed_email(
+                    peer_ip, 
+                    envelope.mail_from, 
+                    envelope.content, 
+                    error_message
+                )
+                if record_id:
+                    logger.info(f"💾 失败邮件已保存到数据库，ID: {record_id}")
+                    saved_to_db = True
+            except Exception as e:
+                logger.error(f"❌ 数据库保存失败邮件异常: {e}")
+        
+        # JSON文件备份
+        if not saved_to_db or ENABLE_JSON_BACKUP:
+            try:
+                raw_data = {
+                    'timestamp': time.time(),
+                    'datetime': datetime.now().isoformat(),
+                    'sender_ip': peer_ip,
+                    'from': envelope.mail_from,
+                    'to': envelope.rcpt_tos,
+                    'raw_content': envelope.content.decode('utf-8', errors='ignore'),
+                    'status': 'parsing_failed',
+                    'error_message': error_message
+                }
+                
+                filename = f"raw_email_{int(raw_data['timestamp'])}.json"
+                filepath = os.path.join(DATA_DIR, filename)
+                
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(raw_data, f, ensure_ascii=False, indent=2)
+                
+                logger.info(f"💾 原始邮件JSON备份已保存: {filepath}")
+                
+            except Exception as e:
+                logger.error(f"保存原始邮件JSON备份失败: {e}")
     
     def print_email_summary(self, email_data):
         """在控制台打印邮件摘要"""
@@ -237,8 +318,10 @@ def main():
     """主函数"""
     print("🚀 启动简单SMTP邮件监听器")
     print(f"📂 数据保存目录: {DATA_DIR}")
+    print(f"🗄️  数据库: {MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE if ENABLE_DATABASE else '未启用'}")
     print(f"🌐 监听端口: {SMTP_PORT}")
-    print(f"🏷️  允许的域名: {ALLOWED_DOMAINS}")
+    print(f"🏷️  域名策略: {'接受所有域名' if ACCEPT_ALL_DOMAINS else '仅限配置域名'}")
+    print(f"💾 存储模式: {'数据库+JSON备份' if ENABLE_DATABASE and ENABLE_JSON_BACKUP else ('仅数据库' if ENABLE_DATABASE else '仅JSON文件')}")
     print("💡 修改脚本开头的配置参数来适配您的需求")
     print("\n" + "="*60)
     
